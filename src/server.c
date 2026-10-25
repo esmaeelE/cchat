@@ -1,5 +1,3 @@
-//~ ./server 9090
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,19 +11,42 @@
 
 #include "common.h"
 
+/*
+ * Multi-client TCP chat server.
+ *
+ * Architecture:
+ *   - Single-threaded event loop using select() to multiplex the listening
+ *     socket and all connected client sockets.
+ *   - Supports up to MAX_CLIENTS (32) simultaneous clients.
+ *   - Each client must send its nickname as the first message; subsequent
+ *     messages are broadcast to every other joined client.
+ *   - SIGINT/SIGTERM trigger graceful shutdown: all client sockets and the
+ *     listening socket are closed before exit.
+ *   - SIGPIPE is ignored so a write to a disconnected client is reported via
+ *     the return value of send_message instead of killing the process.
+ *
+ * Client state is stored in a fixed-size Client table; a slot with fd < 0
+ * is free.
+ */
+
 typedef struct {
-    int fd;
-    char nick[NICK_SIZE];
-    int has_nick;
+    int fd;             /* connected socket, or -1 when slot is free      */
+    char nick[NICK_SIZE];/* client's chosen nickname                       */
+    int has_nick;       /* 1 once the nickname handshake is complete      */
 } Client;
 
 static volatile sig_atomic_t running = 1;
 
+/* SIGINT/SIGTERM handler: sets running to 0 so the main loop exits and
+ * performs a graceful shutdown. */
 static void handle_sigint(int sig) {
     (void)sig;
     running = 0;
 }
 
+/* Broadcast data of length len to every joined client except sender.
+ * Skips free slots and clients that have not completed the nickname
+ * handshake (they are not yet part of the chat). */
 static void broadcast(Client *clients, int sender, const char *data, uint32_t len) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd >= 0 && clients[i].fd != sender && clients[i].has_nick)
@@ -38,10 +59,12 @@ int main(int argc, char *argv[]) {
     if (argc > 1)
         port = parse_port(argv[1]);
 
+    /* Install signal handlers for graceful shutdown on SIGINT/SIGTERM. */
     struct sigaction sa = { .sa_handler = handle_sigint };
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+    /* Ignore SIGPIPE: writes to closed sockets are handled via return codes. */
     signal(SIGPIPE, SIG_IGN);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -70,6 +93,7 @@ int main(int argc, char *argv[]) {
         clients[i].has_nick = 0;
     }
 
+    /* Main event loop: multiplex on listen_fd and all active client fds. */
     while (running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -85,12 +109,12 @@ int main(int argc, char *argv[]) {
         }
 
         if (select(max_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
-            if (!running) break;
+            if (!running) break;   /* interrupted by signal: exit loop */
             perror("select");
             break;
         }
 
-        /* New connection */
+        /* New connection: accept and allocate a free client slot. */
         if (FD_ISSET(listen_fd, &rfds)) {
             struct sockaddr_in cli_addr;
             socklen_t cli_len = sizeof(cli_addr);
@@ -116,13 +140,14 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        /* Read from clients */
+        /* Read from ready clients. Each ready slot is handled once per loop. */
         char buf[BUF_SIZE];
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].fd >= 0 && FD_ISSET(clients[i].fd, &rfds)) {
                 uint32_t msg_len = 0;
                 int rc = recv_message(clients[i].fd, buf, BUF_SIZE - 1, &msg_len);
                 if (rc <= 0) {
+                    /* Client disconnected or errored: announce and free slot. */
                     if (clients[i].has_nick) {
                         char sys_msg[BUF_SIZE];
                         int n = snprintf(sys_msg, sizeof(sys_msg),
@@ -137,11 +162,11 @@ int main(int argc, char *argv[]) {
                     clients[i].fd = -1;
                     clients[i].has_nick = 0;
                 } else if (!clients[i].has_nick) {
-                    /* First message = nickname */
+                    /* First message from a client is its nickname. */
                     buf[msg_len] = '\0';
                     char *nl = strchr(buf, '\n');
                     if (nl) *nl = '\0';
-                    /* Truncate to nick size */
+                    /* Truncate nickname to fit NICK_SIZE. */
                     if (msg_len >= NICK_SIZE) {
                         buf[NICK_SIZE - 1] = '\0';
                         msg_len = NICK_SIZE - 1;
@@ -155,6 +180,7 @@ int main(int argc, char *argv[]) {
                         broadcast(clients, clients[i].fd, sys_msg, (uint32_t)n);
                     printf("+ %s joined\n", clients[i].nick);
                 } else {
+                    /* Regular chat message: prefix with nickname and broadcast. */
                     buf[msg_len] = '\0';
                     char formatted[BUF_SIZE];
                     int n = snprintf(formatted, sizeof(formatted), "%s> %s",

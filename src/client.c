@@ -1,5 +1,3 @@
-//~ ./client 127.0.0.1 9090
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,8 +11,25 @@
 
 #include "common.h"
 
+/*
+ * TCP chat client.
+ *
+ * Behavior:
+ *   - Connects to host:port (defaults: 127.0.0.1:9090).
+ *   - Reads a nickname from stdin and sends it as the first length-prefixed
+ *     message; the server requires this before the client joins the chat.
+ *   - Uses select() to multiplex stdin and the socket, so the user can type
+ *     messages while simultaneously receiving messages from other clients.
+ *   - Received messages are printed with a "Received> " prefix.
+ *   - SIGINT/SIGTERM trigger a graceful disconnect: the socket is closed and
+ *     the process exits.
+ *   - SIGPIPE is ignored; write errors surface via send_message's return value.
+ */
+
 static volatile sig_atomic_t running = 1;
 
+/* SIGINT/SIGTERM handler: sets running to 0 so the main loop exits and the
+ * socket is closed cleanly. */
 static void handle_sigint(int sig) {
     (void)sig;
     running = 0;
@@ -49,7 +64,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    /* Send nickname as first message */
+    /* Send nickname as the first message so the server can identify us. */
     char nick[NICK_SIZE];
     printf("Enter nickname: ");
     fflush(stdout);
@@ -66,6 +81,7 @@ int main(int argc, char *argv[]) {
 
     printf("Connected to %s:%d. Type messages, Ctrl+C to quit.\n", host, port);
 
+    /* Event loop: multiplex stdin and the socket with select(). */
     while (running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -74,11 +90,12 @@ int main(int argc, char *argv[]) {
         int max_fd = fd > STDIN_FILENO ? fd : STDIN_FILENO;
 
         if (select(max_fd + 1, &rfds, NULL, NULL, NULL) < 0) {
-            if (!running) break;
+            if (!running) break;   /* interrupted by signal: exit loop */
             perror("select");
             break;
         }
 
+        /* User typed a line: send it to the server as a chat message. */
         if (FD_ISSET(STDIN_FILENO, &rfds)) {
             char send_buf[BUF_SIZE];
             if (fgets(send_buf, sizeof(send_buf), stdin) == NULL)
@@ -90,6 +107,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        /* A message arrived from the server: print it to the terminal. */
         if (FD_ISSET(fd, &rfds)) {
             char recv_buf[BUF_SIZE];
             uint32_t msg_len = 0;
